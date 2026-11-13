@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""端到端自检：CSV 校验、发布、结构合并、类型提升、并发、重启持久化、Web 入口。
+"""端到端自检：CSV 校验、发布、结构合并、类型提升、并发、重启持久化、
+批次撤回 / 固定快照 / 租约回收 / 崩溃接续、Web 入口。
 
 用法（在仓库根目录，容器内或装好依赖的环境）：
     python scripts/selftest.py
 """
 import io
+import multiprocessing
 import os
 import re
 import sys
 import tempfile
 import threading
+import time
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import catalog, csvparse, service, store  # noqa: E402
+from app import catalog, csvparse, retention, service, store  # noqa: E402
 from app.config import Config  # noqa: E402
 
 
@@ -43,6 +46,20 @@ def snap_of(cfg, station=None):
         return catalog.snapshot(conn, station)
     finally:
         conn.close()
+
+
+def batch_row(cfg, batch_id):
+    conn = catalog.connect(cfg.db_path)
+    try:
+        return dict(conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone())
+    finally:
+        conn.close()
+
+
+def publish_text(cfg, tmp, name, text, types, station="站A"):
+    path = os.path.join(tmp, name)
+    write(path, text)
+    return service.publish(cfg, station, name, path, types)
 
 
 # ---------- 1. CSV 解析与校验 ----------
@@ -223,7 +240,228 @@ def test_restart(tmp):
         for b in snap["batches"]))
 
 
-# ---------- 6. Web 入口 ----------
+# ---------- 6. 撤回 / 固定快照 / 回收 ----------
+
+def test_retract(tmp):
+    cfg = make_cfg(tmp)
+    a = publish_text(cfg, tmp, "a.csv", "日期,麻雀\n2024-01-01,3\n", ["uint64"])
+    b = publish_text(cfg, tmp, "b.csv", "日期,麻雀\n2024-02-01,4\n", ["uint64"], station="站B")
+
+    r = service.retract_batch(cfg, a["batch_id"][:8], "误交")
+    check("按唯一前缀撤回", r["status"] == "retracted", str(r["status"]))
+    row = batch_row(cfg, a["batch_id"])
+    check("记录保留站点/文件名/行数", (row["station"], row["source_filename"], row["n_rows"])
+          == ("站A", "a.csv", 1))
+    check("记录撤回时间与原因", bool(row["retracted_at"]) and row["retract_note"] == "误交")
+
+    snap = snap_of(cfg)
+    check("新快照排除撤回批", [x["id"] for x in snap["batches"]] == [b["batch_id"]])
+    _, table = store.load_unified(cfg.parquet_dir, snap["columns"], snap["batches"])
+    check("新取数只剩另一批", table.num_rows == 1 and table.to_pylist()[0]["麻雀"] == 4)
+
+    # 无读者 => 撤回后文件被回收，记录不丢
+    check("撤回后文件回收", not os.path.exists(os.path.join(cfg.parquet_dir, a["batch_id"] + ".parquet")))
+    check("回收状态 done", batch_row(cfg, a["batch_id"])["reclaim_state"] == "done")
+    check("其他批次文件完好", os.path.isfile(os.path.join(cfg.parquet_dir, b["batch_id"] + ".parquet")))
+    check("全量记录仍含两批", len(catalog.all_batches(
+        catalog.connect(cfg.db_path))) == 2)
+
+    before = batch_row(cfg, a["batch_id"])
+    r2 = service.retract_batch(cfg, a["batch_id"], "重复")
+    after = batch_row(cfg, a["batch_id"])
+    check("重复撤回复用原记录", r2["status"] == "already_retracted"
+          and r2["batch"]["retracted_at"] == before["retracted_at"]
+          and r2["batch"]["retract_note"] == "误交")
+    check("重复撤回不改任何字段", before == after)
+
+    # 类型提升不回退：撤回不会动逻辑结构
+    publish_text(cfg, tmp, "c1.csv", "日期,白鹭\n2024-03-01,约5\n", ["text"])
+    c2 = publish_text(cfg, tmp, "c2.csv", "日期,白鹭\n2024-03-02,6\n", ["uint64"])
+    types = {x["name"]: x["type"] for x in snap_of(cfg)["columns"]}
+    check("撤回前类型已提升", types["白鹭"] == "text")
+    service.retract_batch(cfg, c2["batch_id"])
+    types2 = {x["name"]: x["type"] for x in snap_of(cfg)["columns"]}
+    check("撤回后逻辑结构不回退", types2 == types, str(types2))
+
+
+def test_pinned_snapshot(tmp):
+    cfg = make_cfg(tmp)
+    a = publish_text(cfg, tmp, "a.csv", "日期,麻雀\n2024-01-01,3\n", ["uint64"])
+
+    pin = retention.pin_snapshot(cfg)          # 固定快照，但尚未打开 Parquet
+    r = service.retract_batch(cfg, a["batch_id"])
+    check("撤回成功", r["status"] == "retracted")
+    row = batch_row(cfg, a["batch_id"])
+    path = os.path.join(cfg.parquet_dir, a["batch_id"] + ".parquet")
+    check("有读者租约 => 待回收且文件仍在",
+          row["reclaim_state"] == "pending" and os.path.isfile(path))
+    check("撤回不改可见性以外的记录", row["retracted_at"] in (r["batch"]["retracted_at"],))
+
+    schema, table = pin.load_unified()         # 撤回之后才打开 Parquet
+    check("固定快照仍完整返回原结果",
+          table.num_rows == 1 and table.to_pylist()[0]["麻雀"] == 3
+          and schema.names == ["obs_date", "麻雀"])
+
+    pin.release()
+    check("读者释放后回收该批文件", not os.path.exists(path))
+    check("释放后标记完成", batch_row(cfg, a["batch_id"])["reclaim_state"] == "done")
+    check("新取数仍排除该批", snap_of(cfg)["batches"] == [])
+
+
+def test_lease_expiry(tmp):
+    """读者进程退出（不释放租约）=> 租约过期后回收，不永久占用。"""
+    cfg = make_cfg(tmp)
+    a = publish_text(cfg, tmp, "a.csv", "日期,麻雀\n2024-01-01,3\n", ["uint64"])
+    path = os.path.join(cfg.parquet_dir, a["batch_id"] + ".parquet")
+    ttl_before = retention.LEASE_TTL_SEC
+    retention.LEASE_TTL_SEC = 1.0
+    try:
+        conn = catalog.connect(cfg.db_path)
+        with catalog.write_txn(conn):
+            conn.execute(
+                "INSERT INTO leases(lease_id,batch_id,parquet_file,owner,created_at,expires_at)"
+                " VALUES(?,?,?,?,?,?)",
+                ("dead", a["batch_id"], a["batch_id"] + ".parquet", "dead-proc",
+                 time.time(), time.time() + 1.0))
+        conn.close()
+        service.retract_batch(cfg, a["batch_id"])
+        check("僵尸租约未过期时保持待回收",
+              retention.reclaim(cfg, batch_id=a["batch_id"])[0]["state"] == "pending"
+              and os.path.isfile(path))
+        time.sleep(1.2)
+        check("租约过期后回收",
+              retention.reclaim(cfg, batch_id=a["batch_id"])[0]["state"] == "done"
+              and not os.path.exists(path))
+    finally:
+        retention.LEASE_TTL_SEC = ttl_before
+
+
+def test_crash_recovery(tmp):
+    cfg = make_cfg(tmp)
+    a = publish_text(cfg, tmp, "a.csv", "日期,麻雀\n2024-01-01,3\n", ["uint64"])
+    b = publish_text(cfg, tmp, "b.csv", "日期,麻雀\n2024-02-01,4\n", ["uint64"])
+    b_file = os.path.join(cfg.parquet_dir, b["batch_id"] + ".parquet")
+
+    # 模拟「撤回已提交、删除前进程中断」
+    conn = catalog.connect(cfg.db_path)
+    with catalog.write_txn(conn):
+        conn.execute("UPDATE batches SET retracted_at=?, reclaim_state='pending' WHERE id=?",
+                     ("2024-01-01T00:00:00+00:00", a["batch_id"]))
+    conn.close()
+    cfg2 = Config(cfg.data_dir)
+    service.init_storage(cfg2)                 # 重启
+    row = batch_row(cfg2, a["batch_id"])
+    check("重启接续回收", row["reclaim_state"] == "done" and row["retracted_at"])
+    check("重启不会恢复可见性", [x["id"] for x in snap_of(cfg2)["batches"]] == [b["batch_id"]])
+    check("重启不误删其他批次", os.path.isfile(b_file))
+
+    # 模拟「文件已删、状态未落盘就中断」
+    c = publish_text(cfg, tmp, "c.csv", "日期,麻雀\n2024-03-01,5\n", ["uint64"])
+    c_file = os.path.join(cfg.parquet_dir, c["batch_id"] + ".parquet")
+    os.unlink(c_file)
+    conn = catalog.connect(cfg.db_path)
+    with catalog.write_txn(conn):
+        conn.execute("UPDATE batches SET retracted_at=?, reclaim_state='pending' WHERE id=?",
+                     ("2024-01-02T00:00:00+00:00", c["batch_id"]))
+    conn.close()
+    service.init_storage(Config(cfg.data_dir))
+    check("删除后中断：重启补记完成", batch_row(cfg, c["batch_id"])["reclaim_state"] == "done")
+    check("补记不改撤回记录", batch_row(cfg, c["batch_id"])["retracted_at"]
+          == "2024-01-02T00:00:00+00:00")
+
+
+def test_reclaim_error_retry(tmp):
+    cfg = make_cfg(tmp)
+    a = publish_text(cfg, tmp, "a.csv", "日期,麻雀\n2024-01-01,3\n", ["uint64"])
+    path = os.path.join(cfg.parquet_dir, a["batch_id"] + ".parquet")
+
+    # 让删除失败一次（模拟权限 / IO 错误）；此时文件还在（未撤回前不回收）
+    real_unlink = os.unlink
+
+    def flaky(p):
+        if p == path:
+            raise PermissionError("simulated deny")
+        return real_unlink(p)
+
+    os.unlink = flaky
+    try:
+        r = service.retract_batch(cfg, a["batch_id"])
+        res = retention.reclaim(cfg, batch_id=a["batch_id"])
+    finally:
+        os.unlink = real_unlink
+    check("撤回提交", r["status"] == "retracted")
+    check("删除失败显示 error", res[0]["state"] == "error", str(res))
+    row = batch_row(cfg, a["batch_id"])
+    check("错误信息入库", row["reclaim_state"] == "error" and "simulated" in row["reclaim_error"])
+    check("失败时撤回记录不变", row["retracted_at"] is not None)
+    check("失败时文件保留待重试", os.path.isfile(path))
+
+    check("重试成功", retention.reclaim(cfg, batch_id=a["batch_id"], include_error=True)[0]["state"]
+          == "done")
+    check("重试后文件已删", not os.path.exists(path))
+    check("重试后撤回记录仍在", batch_row(cfg, a["batch_id"])["retracted_at"] is not None)
+    check("重试后状态 done", batch_row(cfg, a["batch_id"])["reclaim_state"] == "done")
+
+
+def _slow_reader_proc(data_dir, batch_id, q):
+    """独立进程：固定快照后睡到主进程放行，再打开 Parquet。"""
+    cfg = Config(data_dir)
+    pin = retention.pin_snapshot(cfg)
+    q.put("pinned")
+    q.get()
+    _schema, table = pin.load_unified()
+    q.put(("read", table.num_rows, table.to_pylist()[0]["麻雀"]))
+    pin.release()
+    q.put("released")
+
+
+def test_multiprocess_slow_read(tmp):
+    """多进程共用 DATA_DIR：慢取数不阻塞撤回 / 上传 / 取数，且完整返回原结果。"""
+    cfg = make_cfg(tmp)
+    big = publish_text(cfg, tmp, "big.csv",
+                       "日期,麻雀\n" + "".join(f"2024-01-{i % 28 + 1:02d},{i}\n" for i in range(20000)),
+                       ["uint64"], station="慢站")
+
+    ctx = multiprocessing.get_context("spawn")
+    q = ctx.Queue()
+    proc = ctx.Process(target=_slow_reader_proc, args=(cfg.data_dir, big["batch_id"], q))
+    proc.start()
+    try:
+        check("慢读者已固定快照", q.get(timeout=60) == "pinned")
+        # 慢读者此刻尚未打开 Parquet，且不持有任何库事务
+        t0 = time.time()
+        r = service.retract_batch(cfg, big["batch_id"], "并发撤回")
+        t_retract = time.time() - t0
+        check("撤回成功", r["status"] == "retracted")
+        t0 = time.time()
+        other = publish_text(cfg, tmp, "u.csv", "日期,麻雀\n2024-06-01,9\n", ["uint64"], station="新站")
+        t_upload = time.time() - t0
+        t0 = time.time()
+        snap_of(cfg)
+        t_snap = time.time() - t0
+        check("慢取数期间撤回不阻塞", t_retract < 2.0, f"{t_retract:.2f}s")
+        check("慢取数期间上传不阻塞", t_upload < 2.0, f"{t_upload:.2f}s")
+        check("慢取数期间取数不阻塞", t_snap < 2.0, f"{t_snap:.2f}s")
+
+        q.put("go")
+        result = q.get(timeout=60)
+        check("慢读者跨撤回完整返回原结果",
+              result[0] == "read" and result[1] == 20000 and result[2] == 0, str(result))
+        check("读者释放", q.get(timeout=60) == "released")
+        proc.join(timeout=60)
+        check("读者进程正常退出", proc.exitcode == 0)
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=10)
+
+    retention.reclaim(cfg)
+    check("释放后回收该批", batch_row(cfg, big["batch_id"])["reclaim_state"] == "done")
+    check("其他批次文件完好",
+          os.path.isfile(os.path.join(cfg.parquet_dir, other["batch_id"] + ".parquet")))
+
+
+# ---------- 7. Web 入口 ----------
 
 def test_web(tmp):
     os.environ["DATA_DIR"] = os.path.join(tmp, "webdata")
@@ -255,6 +493,29 @@ def test_web(tmp):
     check("下载统一CSV", r.status_code == 200 and r.headers["Content-Type"].startswith("text/csv"))
     check("CSV含表头与数据", "obs_date" in body and "麻雀" in body and "12" in body)
 
+    # 网页按批次 ID 撤回
+    r = c.get("/batches")
+    check("批次页200", r.status_code == 200 and "按批次 ID 撤回".encode() in r.data)
+    batch_id = re.search(r'name="batch_id" value="([0-9a-f]{32})"', r.data.decode()).group(1)
+    r = c.post("/retract", data={"batch_id": batch_id[:8], "note": "网页撤回"},
+               follow_redirects=True)
+    check("网页撤回成功提示", "已撤回".encode() in r.data)
+    check("撤回记录显示", "网页撤回".encode() in r.data and "已撤回".encode() in r.data)
+    check("待回收或已回收状态可见",
+          "已回收".encode() in r.data or "待回收".encode() in r.data)
+    r = c.get("/download.csv?station=青湾")
+    check("撤回后下载排除该批", b"2023-05-01" not in r.data)
+    r = c.get("/preview?station=青湾")
+    check("撤回后预览排除该批", b"2023-05-01" not in r.data and "共 0 行".encode() in r.data)
+    r = c.post("/retract", data={"batch_id": batch_id}, follow_redirects=True)
+    check("网页重复撤回复用原记录", "此前已撤回".encode() in r.data)
+    r = c.post("/retract", data={"batch_id": "ffffffff", "next": "/batches"},
+               follow_redirects=True)
+    check("网页撤回不存在批次报错", "找不到该批次".encode() in r.data)
+    r = c.post("/reclaim", data={"batch_id": batch_id}, follow_redirects=True)
+    check("网页回收无待回收提示", "回收完成".encode() in r.data
+          or "没有待回收".encode() in r.data or "待回收".encode() in r.data)
+
     # 坏整数批次：网页流程下整批不发布
     data = {"station": "青湾",
             "file": (io.BytesIO("日期,麻雀\n2023-05-02,oops\n".encode("utf-8")), "bad.csv")}
@@ -274,6 +535,12 @@ def main():
             ("并发发布（新增列 + 同列类型冲突）", test_concurrent),
             ("坏整数 / 写盘失败整批不发布", test_bad_batch),
             ("重启后已发布数据可用", test_restart),
+            ("按批次撤回 / 记录保留 / 排除取数", test_retract),
+            ("固定快照跨撤回 / 读者释放后回收", test_pinned_snapshot),
+            ("读者进程退出后租约过期回收", test_lease_expiry),
+            ("删除失败可重试 / 中断后重启接续", test_crash_recovery),
+            ("删除错误状态与重试", test_reclaim_error_retry),
+            ("多进程共用 DATA_DIR：慢取数不阻塞", test_multiprocess_slow_read),
             ("Web 入口（Flask test client）", test_web),
         ]
         for i, (title, fn) in enumerate(steps, 1):

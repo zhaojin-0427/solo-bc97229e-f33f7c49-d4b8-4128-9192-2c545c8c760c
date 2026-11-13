@@ -12,9 +12,11 @@ COPY app ./app
 COPY scripts ./scripts
 COPY samples ./samples
 
-ENV DATA_DIR=/data
+ENV DATA_DIR=/data \
+    LEASE_TTL_SEC=30 \
+    RECLAIM_INTERVAL_SEC=2
 VOLUME ["/data"]
 EXPOSE 8000
 
-# 2 个 worker 进程验证并发发布的安全性（目录库写事务串行化）
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "--threads", "4", "--timeout", "120", "app.web:app"]
+# 多 worker 进程共享 DATA_DIR：验证撤回 / 租约 / 回收在多进程下成立
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "3", "--threads", "4", "--timeout", "300", "app.web:app"]

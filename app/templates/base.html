@@ -23,6 +23,11 @@
   input,select,button{font:inherit;padding:.35rem .5rem}
   button{background:#2f6b4f;color:#fff;border:0;border-radius:6px;padding:.45rem 1rem;cursor:pointer}
   .pill{display:inline-block;background:#eef4f0;border:1px solid #cfddd3;border-radius:999px;padding:.05rem .6rem;font-size:.8rem}
+  .pill.warn{background:#fdf3dd;border-color:#ecd9a8}
+  .pill.err{background:#fbe4e4;border-color:#eec2c2}
+  .pill.ok{background:#e2f3e7;border-color:#b7dfc4}
+  .row-retracted td{background:#f7f7f5;color:#777}
+  input.note{width:16rem}
 </style>
 </head>
 <body>
@@ -32,6 +37,7 @@
   <a href="{{ url_for('upload_form') }}">上传批次</a>
   <a href="{{ url_for('preview') }}">预览</a>
   <a href="{{ url_for('download_csv') }}">下载统一CSV</a>
+  <a href="{{ url_for('batches') }}">批次与撤回</a>
 </header>
 <main>
 {% for m in get_flashed_messages(category_filter=["ok"]) %}<div class="flash ok">{{ m }}</div>{% endfor %}

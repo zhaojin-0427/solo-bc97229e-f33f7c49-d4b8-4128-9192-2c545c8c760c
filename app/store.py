@@ -5,11 +5,11 @@
 - 统一读取：按目录快照中的逻辑结构投影每个批次文件——缺列补 NULL，
   逻辑类型为 text 而文件列为 uint64 时按十进制转成文本。
 """
+import datetime
 import os
 
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
 
 DATE_COLUMN = "obs_date"  # 首列观测日归一化为固定列名
@@ -89,6 +89,26 @@ def load_unified(parquet_dir, columns, batches):
 
 
 def table_to_csv_bytes(table):
-    sink = pa.BufferOutputStream()
-    pcsv.write_csv(table, sink)
-    return sink.getvalue().to_pybytes()
+    """统一结构 CSV：表头原样（中文列名不加引号），NULL 为空单元格。
+
+    自己序列化以保证所有平台 / PyArrow 版本下输出稳定（PyArrow 的 CSV writer
+    会给非 ASCII 表头加引号，列序与类型虽正确但可读性不一致）。
+    """
+    import csv
+    import io
+
+    buf = io.StringIO(newline="")
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(table.schema.names)
+    for row in table.to_pylist():
+        vals = []
+        for name in table.schema.names:
+            v = row[name]
+            if v is None:
+                vals.append("")
+            elif isinstance(v, datetime.date):
+                vals.append(v.isoformat())
+            else:
+                vals.append(str(v))
+        w.writerow(vals)
+    return buf.getvalue().encode("utf-8")

@@ -17,7 +17,8 @@
     <button type="submit">刷新</button>
     <a href="{{ url_for('download_csv', station=station or '') }}">下载该范围 CSV</a>
   </form>
-  <p class="muted">共 {{ total }} 行，显示前 {{ rows|length }} 行；空单元格为 NULL。</p>
+  <p class="muted">共 {{ total }} 行，显示前 {{ rows|length }} 行；空单元格为 NULL。
+    已撤回批次不出现在任何新预览 / 下载中。</p>
   <div style="overflow-x:auto">
   <table>
     <tr>{% for c in columns %}<th>{{ c }}</th>{% endfor %}</tr>

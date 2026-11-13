@@ -7,6 +7,9 @@ services:
     environment:
       DATA_DIR: /data
       SECRET_KEY: dev-only-change-me
+      # 读者租约有效期与后台回收扫描间隔（多 worker 共享同一 DATA_DIR）
+      LEASE_TTL_SEC: "30"
+      RECLAIM_INTERVAL_SEC: "2"
     volumes:
       - lake_data:/data
     restart: unless-stopped

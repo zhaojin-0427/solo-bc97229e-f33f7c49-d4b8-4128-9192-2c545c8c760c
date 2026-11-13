@@ -28,14 +28,23 @@
 </div>
 <div class="card">
   <h2>批次（每批一个独立 Parquet，既有文件不重写）</h2>
+  <p class="muted">调查误交时可整批撤回；撤回后新预览 / 下载不再包含该批，撤回记录永久保留。
+    完整记录与回收状态见 <a href="{{ url_for('batches') }}">批次与撤回</a>。</p>
   {% if recent %}
   <table>
-    <tr><th>批次</th><th>站点</th><th>源文件</th><th>行数</th><th>Parquet 文件</th><th>发布时间 (UTC)</th></tr>
+    <tr><th>批次</th><th>站点</th><th>源文件</th><th>行数</th><th>Parquet 文件</th><th>发布时间 (UTC)</th><th>撤回</th></tr>
     {% for b in recent %}
     <tr>
       <td><code>{{ b["id"][:8] }}</code></td><td>{{ b["station"] }}</td>
       <td>{{ b["source_filename"] }}</td><td>{{ b["n_rows"] }}</td>
       <td><code>{{ b["parquet_file"] }}</code></td><td>{{ b["created_at"] }}</td>
+      <td>
+        <form method="post" action="{{ url_for('retract') }}" onsubmit="return confirm('确认撤回整批 {{ b['id'][:8] }}？撤回后新取数不再包含该批。');">
+          <input type="hidden" name="batch_id" value="{{ b['id'] }}">
+          <input class="note" name="note" placeholder="撤回原因（可选）" maxlength="500">
+          <button type="submit">撤回该批</button>
+        </form>
+      </td>
     </tr>
     {% endfor %}
   </table>

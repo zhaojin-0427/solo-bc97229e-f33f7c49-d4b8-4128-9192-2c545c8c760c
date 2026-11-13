@@ -12,7 +12,7 @@ import shutil
 import time
 import uuid
 
-from . import catalog, csvparse, store
+from . import catalog, csvparse, retention, store
 
 _TOKEN_RE = re.compile(r"[0-9a-f]{32}")
 STAGING_MAX_AGE_SEC = 3600
@@ -26,6 +26,8 @@ def init_storage(cfg):
     catalog.init_db(cfg.db_path)
     cleanup_staging(cfg)
     cleanup_orphan_files(cfg)
+    # 接续上次进程中断的回收：已撤回批次不会恢复可见性，也不会永久占盘
+    retention.recover(cfg)
 
 
 # ---------- 暂存（声明列类型的两步表单之间） ----------
@@ -57,6 +59,15 @@ def discard_staged(cfg, token):
             os.unlink(os.path.join(cfg.staging_dir, token + ".csv"))
         except OSError:
             pass
+
+
+def retract_batch(cfg, batch_ref, note=""):
+    """撤回整批观测（保留站点 / 文件名 / 行数 / 撤回记录）。"""
+    result = retention.retract(cfg, batch_ref, note)
+    if result["status"] == "retracted":
+        retention.reclaim(cfg, batch_id=result["batch"]["id"])
+        retention.wake_reclaimer(cfg)
+    return result
 
 
 # ---------- 发布 ----------
@@ -129,10 +140,14 @@ def cleanup_staging(cfg, max_age_sec=STAGING_MAX_AGE_SEC):
 
 
 def cleanup_orphan_files(cfg, max_age_sec=ORPHAN_MAX_AGE_SEC):
-    """清理崩溃遗留：临时文件一律删；未被目录引用的 Parquet 超过宽限期才删
-    （宽限期避免误删其他进程刚 rename、尚未登记的批次文件）。"""
+    """清理崩溃遗留的临时文件与从未登记的残件。
+
+    宽限期（max_age_sec）避免误删其他进程刚 rename、尚未登记的批次文件；
+    已撤回、等待回收的批次仍被目录引用，由 retention 回收流程处理，
+    这里绝不抢先删除（避免绕过租约、误删读者正在读的文件）。"""
     conn = catalog.connect(cfg.db_path)
     try:
+        # 含已撤回批次：其文件归回收流程管，孤儿清理只管从未登记的残件
         referenced = {r["parquet_file"] for r in conn.execute("SELECT parquet_file FROM batches")}
     finally:
         conn.close()

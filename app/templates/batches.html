@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>按批次 ID 撤回</h2>
+  <p class="muted">
+    撤回整批观测，避免研究员继续取用。撤回后：
+    <b>新预览与下载立即排除该批</b>；此前已固定快照的取数仍完整返回原结果；
+    站点、源文件名、行数、撤回时间与原因永久保留。撤回不可恢复。
+    可填写完整批次 ID 或唯一前缀（至少 4 位十六进制）。
+  </p>
+  <form method="post" action="{{ url_for('retract') }}">
+    <p>批次 ID：<input name="batch_id" required placeholder="完整 UUID 或唯一前缀" size="40"
+                     value="{{ request.args.get('batch_id', '') }}"></p>
+    <p>撤回原因：<input class="note" name="note" placeholder="如：误交 / 重复提交（可选）" maxlength="500"></p>
+    <p><button type="submit">撤回整批</button></p>
+  </form>
+</div>
+
+<div class="card">
+  <h2>批次与回收状态</h2>
+  <p class="muted">
+    撤回后的文件在有读者租约时保持「待回收」，读者全部释放后自动删除并标记「已回收」；
+    删除失败显示「删除错误」，可重试（重启后也会自动接续）。撤回记录不随文件删除而消失。
+  </p>
+  <form method="post" action="{{ url_for('reclaim_pending_route') }}">
+    <button type="submit">重试所有待回收 / 删除错误</button>
+  </form>
+  {% if batches %}
+  <table>
+    <tr>
+      <th>批次 ID</th><th>状态</th><th>站点</th><th>源文件</th><th>行数</th>
+      <th>发布 (UTC)</th><th>撤回记录</th><th>回收</th><th>操作</th>
+    </tr>
+    {% for b in batches %}
+    <tr class="{{ 'row-retracted' if b['retracted_at'] else '' }}">
+      <td><code>{{ b["id"] }}</code></td>
+      <td>
+        {% if b["retracted_at"] %}<span class="pill warn">已撤回</span>
+        {% else %}<span class="pill ok">在用</span>{% endif %}
+      </td>
+      <td>{{ b["station"] }}</td>
+      <td>{{ b["source_filename"] }}</td>
+      <td>{{ b["n_rows"] }}</td>
+      <td>{{ b["created_at"] }}</td>
+      <td>
+        {% if b["retracted_at"] %}
+          {{ b["retracted_at"] }}{% if b["retract_note"] %}<br><span class="muted">原因：{{ b["retract_note"] }}</span>{% endif %}
+          <br><code>{{ b["parquet_file"] }}</code>
+        {% else %}<span class="muted">—</span>{% endif %}
+      </td>
+      <td>
+        {% if b["reclaim_state"] == "pending" %}<span class="pill warn">待回收</span>
+        {% elif b["reclaim_state"] == "done" %}<span class="pill">已回收{% if b["reclaimed_at"] %} {{ b["reclaimed_at"] }}{% endif %}</span>
+        {% elif b["reclaim_state"] == "error" %}<span class="pill err">删除错误</span>
+          {% if b["reclaim_error"] %}<br><span class="muted">{{ b["reclaim_error"] }}</span>{% endif %}
+        {% else %}<span class="muted">—</span>{% endif %}
+      </td>
+      <td>
+        {% if b["retracted_at"] %}
+          {% if b["reclaim_state"] in ("pending", "error") %}
+          <form method="post" action="{{ url_for('reclaim_route') }}">
+            <input type="hidden" name="batch_id" value="{{ b['id'] }}">
+            <button type="submit">重试回收</button>
+          </form>
+          {% endif %}
+          <form method="post" action="{{ url_for('retract') }}">
+            <input type="hidden" name="batch_id" value="{{ b['id'] }}">
+            <button type="submit">重复撤回</button>
+          </form>
+        {% else %}
+          <form method="post" action="{{ url_for('retract') }}"
+                onsubmit="return confirm('确认撤回整批 {{ b['id'][:8] }}？');">
+            <input type="hidden" name="batch_id" value="{{ b['id'] }}">
+            <input class="note" name="note" placeholder="撤回原因（可选）" maxlength="500">
+            <button type="submit">撤回该批</button>
+          </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">还没有批次。</p>{% endif %}
+</div>
+{% endblock %}
